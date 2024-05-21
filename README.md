@@ -1,2 +1,2 @@
-# lgsm
+# LGSM
 Latent Galaxy SED Model
