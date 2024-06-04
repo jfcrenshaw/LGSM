@@ -1,4 +1,5 @@
 """Object to return important paths."""
+
 from pathlib import Path
 from types import SimpleNamespace
 

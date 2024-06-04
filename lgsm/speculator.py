@@ -1,9 +1,12 @@
 """This module defines the spectral decoder that predicts spectra."""
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
+from scipy import stats
 from torch import nn
 
 from .paths import paths
@@ -127,7 +130,11 @@ class SpeculatorModule(nn.Module):
 
         return pca_coeff
 
-    def reconstruct_spectrum(self, pca_coeff: torch.tensor) -> torch.tensor:
+    def reconstruct_spectrum(
+        self,
+        pca_coeff: torch.tensor,
+        log_mass: torch.tensor,
+    ) -> torch.tensor:
         """Reconstruct the SED from the PCA coefficients."""
         # Linear combo of basis vector
         log_spectrum = pca_coeff @ self.pca_basis
@@ -135,20 +142,23 @@ class SpeculatorModule(nn.Module):
         # Undo normalization
         log_spectrum = log_spectrum * self.log_spectrum_scale + self.log_spectrum_shift
 
+        # Add log of stellar mass: log10(stellar mass)
+        log_spectrum = log_spectrum + log_mass * math.log(10)
+
         # Undo log
         spectrum = torch.exp(log_spectrum)
 
         return spectrum
 
-    def forward(self, latents: torch.Tensor) -> torch.tensor:
+    def forward(self, latents: torch.Tensor, log_mass: torch.Tensor) -> torch.tensor:
         """Map latents onto an SED."""
-        return self.reconstruct_spectrum(self.predict_pca_coeff(latents))
+        return self.reconstruct_spectrum(self.predict_pca_coeff(latents), log_mass)
 
     def freeze(
         self,
         latents: bool = True,
-        linear: bool = False,
-        activation: bool = False,
+        linear: bool = True,
+        activation: bool = True,
         pca_norm: bool = True,
         pca_basis: bool = True,
         wavelengths: bool = True,
@@ -160,9 +170,9 @@ class SpeculatorModule(nn.Module):
         ----------
         latents: bool, default=True
             Whether to freeze the parameters that normalize the latent variables.
-        linear: bool, default=False
+        linear: bool, default=True
             Whether to freeze the weights in the linear layers
-        activation: bool, default=False
+        activation: bool, default=True
             Whether to freeze the parameters in the activation layers
         pca_norm: bool, default=True
             Whether to freeze the parameters that normalize the PCA coefficients
@@ -272,11 +282,15 @@ class Speculator(nn.Module):
         optical_wavelengths = self.optical_module.wavelengths
         return torch.hstack((uv_wavelengths, optical_wavelengths))
 
-    def forward(self, latents: torch.Tensor) -> torch.tensor:
+    def forward(
+        self,
+        latents: torch.Tensor,
+        log_mass: torch.Tensor,
+    ) -> torch.tensor:
         """Map latents onto an SED."""
         # Construct spectra in two wavelength ranges
-        uv_spectrum = self.uv_module(latents)
-        optical_spectrum = self.optical_module(latents)
+        uv_spectrum = self.uv_module(latents, log_mass)
+        optical_spectrum = self.optical_module(latents, log_mass)
 
         # Combine into a single spectrum
         spectrum = torch.hstack((uv_spectrum, optical_spectrum))
@@ -286,8 +300,8 @@ class Speculator(nn.Module):
     def freeze(
         self,
         latents: bool = True,
-        linear: bool = False,
-        activation: bool = False,
+        linear: bool = True,
+        activation: bool = True,
         pca_norm: bool = True,
         pca_basis: bool = True,
         wavelengths: bool = True,
@@ -299,9 +313,9 @@ class Speculator(nn.Module):
         ----------
         latents: bool, default=True
             Whether to freeze the parameters that normalize the latent variables.
-        linear: bool, default=False
+        linear: bool, default=True
             Whether to freeze the weights in the linear layers
-        activation: bool, default=False
+        activation: bool, default=True
             Whether to freeze the parameters in the activation layers
         pca_norm: bool, default=True
             Whether to freeze the parameters that normalize the PCA coefficients
@@ -378,3 +392,118 @@ class Speculator(nn.Module):
             wavelengths=wavelengths,
             spectrum=spectrum,
         )
+
+
+def sample_prior(N: int, seed: int) -> torch.Tensor:
+    """Return samples from the latent prior distribution.
+
+    This prior is taken from Table 2 of Alsing 2020.
+    Note the order of parameters is:
+    1. ln(Z/Z*)
+    2-7. ln(SFR ratios), late->early
+    8. sqrt(tau_2)
+    9. n
+    10. tau_1 / tau_2
+    11. ln(f_AGN)
+    12. ln(tau_AGN)
+    13. ln(Z_gas/Z*)
+    14. redshift
+    15. stellar mass
+
+    Parameters
+    ----------
+    N: int
+        The number of samples to return.
+    seed: int
+        The random seed.
+
+    Returns
+    -------
+    torch.Tensor
+        The latent samples
+    """
+    rng = np.random.default_rng(seed)
+
+    # First stellar mass
+    log_mass = rng.uniform(7, 12.5, size=N)
+
+    # Stellar metallicity
+    # per Alsing 2020, we use the Gallazzi 2005 relation
+    Zstar_pp = np.array(
+        [
+            [8.910e00, -6.000e-01, 5.550e-01],
+            [9.110e00, -6.100e-01, 5.350e-01],
+            [9.310e00, -6.500e-01, 5.250e-01],
+            [9.510e00, -6.100e-01, 5.100e-01],
+            [9.720e00, -5.200e-01, 5.100e-01],
+            [9.910e00, -4.100e-01, 4.950e-01],
+            [1.011e01, -2.300e-01, 4.700e-01],
+            [1.031e01, -1.100e-01, 4.100e-01],
+            [1.051e01, -1.000e-02, 3.050e-01],
+            [1.072e01, 4.000e-02, 2.300e-01],
+            [1.091e01, 7.000e-02, 1.900e-01],
+            [1.111e01, 1.000e-01, 1.700e-01],
+            [1.131e01, 1.200e-01, 1.600e-01],
+            [1.151e01, 1.300e-01, 1.600e-01],
+            [1.172e01, 1.400e-01, 1.600e-01],
+            [1.191e01, 1.500e-01, 1.650e-01],
+        ]
+    )
+    Zstar_mean = np.interp(log_mass, Zstar_pp[:, 0], Zstar_pp[:, 1])
+    Zstar_std = np.interp(log_mass, Zstar_pp[:, 0], Zstar_pp[:, 2])
+    a, b = (-1.98 - Zstar_mean) / Zstar_std, (0.19 - Zstar_mean) / Zstar_std
+    Zstar = stats.truncnorm.rvs(a, b, loc=Zstar_mean, scale=Zstar_std, random_state=rng)
+
+    # SFR ratios
+    rSFR = stats.t.ppf(
+        rng.uniform(stats.t.cdf(-5, df=2), stats.t.cdf(+5, df=2), size=(6, N)),
+        df=2,
+    )
+
+    # Sqrt(tau_2)
+    loc = 0.3
+    scale = 1
+    a, b = (0 - loc) / scale, (4 - loc) / scale
+    tau2 = stats.truncnorm.rvs(a, b, loc=loc, scale=scale, size=N, random_state=rng)
+    sqrt_tau2 = np.sqrt(tau2)
+
+    # Calzetti index
+    n = rng.uniform(-1, 0.4, size=N)
+
+    # Tau ratio
+    loc = 1
+    scale = 0.3
+    a, b = (0 - loc) / scale, (2 - loc) / scale
+    tau_ratio = stats.truncnorm.rvs(
+        a, b, loc=loc, scale=scale, size=N, random_state=rng
+    )
+
+    # Log AGN fraction
+    log_fAGN = rng.uniform(-5, np.log10(3), size=N)
+
+    # AGN optical depth
+    tau_AGN = rng.uniform(np.log10(5), np.log10(150), size=N)
+
+    # Gas metallicity
+    Zgas = rng.uniform(-2, 0.5, size=N)
+
+    # Redshift
+    redshift = rng.uniform(0, 2.5, size=N)
+
+    latents = torch.vstack(
+        (
+            torch.from_numpy(Zstar).float(),
+            torch.from_numpy(rSFR).float(),
+            torch.from_numpy(sqrt_tau2).float(),
+            torch.from_numpy(n).float(),
+            torch.from_numpy(tau_ratio).float(),
+            torch.from_numpy(log_fAGN).float(),
+            torch.from_numpy(tau_AGN).float(),
+            torch.from_numpy(Zgas).float(),
+            torch.from_numpy(redshift).float(),
+        )
+    ).T
+    redshift = torch.from_numpy(np.atleast_2d(redshift)).float().T
+    log_mass = torch.from_numpy(np.atleast_2d(log_mass)).float().T
+
+    return redshift, log_mass, latents

@@ -19,3 +19,4 @@ dependencies:
   - pip:
       - normflows
       - photerr
+      - git+https://github.com/aliutkus/torchinterp1d.git
